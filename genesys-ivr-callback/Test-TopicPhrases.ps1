@@ -11,15 +11,28 @@
       2. Polls GET /api/v2/speechandtextanalytics/topics/testphrase/jobs/{jobId}
          until the job finishes
       3. Records processedTranscriptsCount / matchedTranscriptsCount
+      4. Matched conversations (skip with -CountsOnly): the job's per-conversation
+         detail is only published on a WebSocket notification, which Constrained
+         Language Mode can't open. So the script runs
+         POST /api/v2/speechandtextanalytics/transcripts/search for each phrase,
+         downloads each hit's transcript
+         (GET .../conversations/{id}/communications/{id}/transcripturl) and picks the
+         sentence that best matches the phrase. This is wording-based, so it finds
+         fewer conversations than the semantic MatchedTranscripts count.
 
-    Output: a CSV with one row per phrase (matched, processed, match %, job id, state)
-    plus a console table sorted by matches.
+    Output:
+      TopicPhraseTest_<stamp>.csv     one row per phrase: semantic counts, search hits
+      TopicPhraseMatches_<stamp>.csv  one row per conversation: phrase, conversation id,
+                                      speaker, detected transcript sentence, match score
 
     Constrained Language Mode safe (Windows PowerShell 5.1 under AppLocker/WDAC):
     no .NET static calls, no ::new(), no [pscustomobject] casts, no Add-Type.
 
-    OAuth client (Client Credentials grant) role permission:
-      speechAndTextAnalytics:topic:testPhrase
+    OAuth client (Client Credentials grant) role permissions:
+      speechAndTextAnalytics:topic:testPhrase     phrase test jobs (counts)
+      analytics:conversationDetail:view           transcript search
+      recording:recording:view                    transcript search + transcript URL
+      speechAndTextAnalytics:data:view            transcript URL
 
 .EXAMPLE
     # Everything set in the CONFIG block
@@ -115,6 +128,28 @@ param(
     [int]$JobTimeoutSeconds = 600,
     [ValidateRange(0, 10)]
     [int]$MaxRetries = 6,
+
+    # --- Matched conversations (conversation id + detected transcript text) ---
+    # The test-phrase job only returns counts over REST (the per-conversation detail goes
+    # out on a WebSocket notification, which Constrained Language Mode can't open). So
+    # matches come from the transcript search API + each hit's transcript instead. That
+    # search matches WORDING, not meaning: it finds fewer calls than the semantic count.
+    # Skip this stage (counts only):
+    [switch]$CountsOnly,
+    # Max conversations to pull per phrase (each costs 2-3 API calls).
+    [ValidateRange(1, 1000)]
+    [int]$MaxMatchesPerPhrase = 25,
+    # PHRASE = words in order, loose; EXACT_PHRASE = exact wording.
+    [ValidateSet('PHRASE', 'EXACT_PHRASE')]
+    [string]$SearchMatchType = 'PHRASE',
+    # Transcript search field names. Genesys doesn't document these well; if the search
+    # returns HTTP 400 or no hits, these are the first thing to adjust.
+    [string]$SearchTextField = 'transcript.content',
+    [string]$SearchDateField = 'conversationStartTime',
+    [string]$SearchMediaTypeField = 'mediaType',
+    # Minimum word overlap (%) between the phrase and a transcript sentence to report it.
+    [ValidateRange(1, 100)]
+    [int]$MinMatchScore = 60,
 
     [string]$OutputFolder = '.'
 )
@@ -334,7 +369,7 @@ function Invoke-GcApi {
 
         $hint = ''
         if ($status -eq 403) {
-            $hint = ' -- the OAuth client role needs speechAndTextAnalytics:topic:testPhrase and access to the divisions the programs are in.'
+            $hint = ' -- the OAuth client role needs speechAndTextAnalytics:topic:testPhrase (plus analytics:conversationDetail:view, recording:recording:view and speechAndTextAnalytics:data:view for matched conversations) and access to the divisions involved.'
         }
         throw ('Genesys API {0} {1} failed: HTTP {2}. {3}{4}' -f $Method.ToUpper(), $Path, $status, $errText, $hint)
     }
@@ -384,6 +419,173 @@ function Submit-PhraseJob {
 }
 
 # ----------------------------------------------------------------------------------
+# Matched conversations: transcript search + transcript download
+# ----------------------------------------------------------------------------------
+
+# ISO-8601 UTC built from components: culture and calendar independent.
+function Format-IsoUtc {
+    param([datetime]$Date)
+    $u = $Date.ToUniversalTime()
+    return (Get-Padded $u.Year 4) + '-' + (Get-Padded $u.Month 2) + '-' + (Get-Padded $u.Day 2) + 'T' +
+           (Get-Padded $u.Hour 2) + ':' + (Get-Padded $u.Minute 2) + ':' + (Get-Padded $u.Second 2) + '.' +
+           (Get-Padded $u.Millisecond 3) + 'Z'
+}
+
+# First non-empty value among property names (dotted paths allowed, e.g. 'conversation.id').
+function Get-Prop {
+    param($Obj, [string[]]$Names)
+    foreach ($n in $Names) {
+        $cur = $Obj
+        foreach ($part in $n.Split('.')) {
+            if ($null -eq $cur) { break }
+            $cur = $cur.$part
+        }
+        if ($null -ne $cur -and [string]$cur -ne '') { return $cur }
+    }
+    return $null
+}
+
+function Get-Words {
+    param([string]$Text)
+    $t = ([string]$Text).ToLower() -replace "[^a-z0-9' ]", ' '
+    return @($t -split '\s+' | Where-Object { $_ })
+}
+
+# % of the phrase's distinct words that appear in the text; 100 when the phrase
+# appears verbatim (ignoring case/punctuation).
+function Get-MatchScore {
+    param([string[]]$PhraseWords, [string]$Text)
+    $textWords = @(Get-Words $Text)
+    if ($PhraseWords.Count -eq 0 -or $textWords.Count -eq 0) { return 0 }
+    if ((' ' + ($textWords -join ' ') + ' ').Contains(' ' + ($PhraseWords -join ' ') + ' ')) { return 100 }
+    $set = @{}
+    foreach ($w in $textWords) { $set[$w] = $true }
+    $distinct = @{}
+    foreach ($w in $PhraseWords) { $distinct[$w] = $true }
+    $hit = 0
+    foreach ($w in $distinct.Keys) { if ($set.ContainsKey($w)) { $hit++ } }
+    return [int](100 * $hit / $distinct.Count)
+}
+
+function Search-PhraseTranscripts {
+    param([string]$Phrase, [int]$Max)
+    $hits = @()
+    $page = 1
+    $total = 0
+    while ($hits.Count -lt $Max) {
+        $size = $Max - $hits.Count
+        if ($size -gt 100) { $size = 100 }
+        $query = @(
+            @{ type = 'DATE_RANGE'; fields = @($script:SearchDateFieldValue); startValue = $script:StartIso; endValue = $script:EndIso; dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSX" },
+            @{ type = $script:SearchMatchTypeValue; fields = @($script:SearchTextFieldValue); value = $Phrase }
+        )
+        if ($script:MediaTypeValue -ne 'all') {
+            $query += , @{ type = 'EXACT'; fields = @($script:SearchMediaTypeFieldValue); value = $script:MediaTypeValue }
+        }
+        $body = @{ types = @('transcripts'); pageSize = $size; pageNumber = $page; sortOrder = 'SCORE'; query = $query }
+        $resp = Invoke-GcApi -Method Post -Path '/api/v2/speechandtextanalytics/transcripts/search' -Body $body
+        if ($null -ne $resp.total) { $total = [int]$resp.total }
+        $got = 0
+        foreach ($r in $resp.results) {
+            if ($null -eq $r) { continue }
+            $got++
+            $hits += , $r
+            if ($hits.Count -ge $Max) { break }
+        }
+        if ($got -lt $size) { break }
+        if ($null -ne $resp.pageCount -and $page -ge [int]$resp.pageCount) { break }
+        $page++
+    }
+    return @{ Total = $total; Hits = $hits }
+}
+
+# Downloads a transcript JSON (pre-signed URL: no Authorization header) via a temp file,
+# so it works whatever content type the storage returns.
+function Get-TranscriptJson {
+    param([string]$Url)
+    $tmp = Join-Path -Path $script:TempFolder -ChildPath 'gc_transcript_tmp.json'
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -ErrorAction Stop | Out-Null
+            break
+        }
+        catch {
+            $status = Get-HttpStatus $_
+            if (($status -eq 429 -or $status -ge 500 -or $status -eq 0) -and $attempt -le 3) { Start-Sleep -Seconds (2 * $attempt); continue }
+            throw ('Transcript download failed: HTTP {0}. {1}' -f $status, (Get-ErrorText $_))
+        }
+    }
+    $raw = Get-Content -Path $tmp -Raw -Encoding UTF8
+    Remove-Item -Path $tmp -Force -ErrorAction SilentlyContinue
+    return ($raw | ConvertFrom-Json)
+}
+
+# Candidate communication ids for a conversation, when the search hit doesn't carry one:
+# every voice session in the analytics record, customer side first.
+function Get-CommunicationIds {
+    param([string]$ConversationId)
+    $conv = Invoke-GcApi -Method Get -Path ('/api/v2/analytics/conversations/' + $ConversationId + '/details')
+    $first = @()
+    $rest = @()
+    foreach ($p in $conv.participants) {
+        foreach ($s in $p.sessions) {
+            if (-not $s.sessionId) { continue }
+            if ([string]$p.purpose -eq 'customer' -or [string]$p.purpose -eq 'external') { $first += [string]$s.sessionId }
+            else { $rest += [string]$s.sessionId }
+        }
+    }
+    return @($first + $rest)
+}
+
+function Get-TranscriptForHit {
+    param([string]$ConversationId, [string]$CommunicationId)
+    $ids = @()
+    if ($CommunicationId) { $ids = @($CommunicationId) } else { $ids = @(Get-CommunicationIds -ConversationId $ConversationId) }
+    $lastErr = 'no communication id found'
+    foreach ($cid in $ids) {
+        try {
+            $u = Invoke-GcApi -Method Get -Path ('/api/v2/speechandtextanalytics/conversations/' + $ConversationId + '/communications/' + $cid + '/transcripturl')
+            if ($null -eq $u -or -not $u.url) { $lastErr = 'transcripturl returned no url'; continue }
+            return @{ CommunicationId = $cid; Transcript = (Get-TranscriptJson -Url ([string]$u.url)); Error = '' }
+        }
+        catch { $lastErr = [string]$_.Exception.Message }
+    }
+    return @{ CommunicationId = ''; Transcript = $null; Error = $lastErr }
+}
+
+# Best-matching sentence in a transcript for one phrase (optionally one speaker side).
+function Find-BestSentence {
+    param($Transcript, [string[]]$PhraseWords, [string]$Side)
+    $best = @{ Score = -1; Text = ''; Speaker = ''; OffsetSec = '' }
+    foreach ($t in $Transcript.transcripts) {
+        $sentences = @(foreach ($ph in $t.phrases) { if ($null -ne $ph -and $ph.text) { $ph } })
+        for ($i = 0; $i -lt $sentences.Count; $i++) {
+            $ph = $sentences[$i]
+            $speaker = ([string]$ph.participantPurpose).ToLower()
+            if ($Side -ne 'both' -and $speaker -and $speaker -ne $Side) { continue }
+            # Also try this sentence joined with the next one from the same speaker,
+            # in case the phrase was split across two transcript segments.
+            $candidates = @([string]$ph.text)
+            if (($i + 1) -lt $sentences.Count -and ([string]$sentences[$i + 1].participantPurpose).ToLower() -eq $speaker) {
+                $candidates += ([string]$ph.text + ' ' + [string]$sentences[$i + 1].text)
+            }
+            foreach ($c in $candidates) {
+                $score = Get-MatchScore -PhraseWords $PhraseWords -Text $c
+                if ($score -gt $best.Score) {
+                    $offset = ''
+                    $ms = Get-Prop $ph @('startTimeMs', 'offsetMs', 'startTime')
+                    if ($null -ne $ms) { try { $offset = [string]([int]([double]$ms / 1000)) } catch { $offset = '' } }
+                    $best = @{ Score = $score; Text = $c; Speaker = $speaker; OffsetSec = $offset }
+                }
+            }
+        }
+    }
+    return $best
+}
+
+# ----------------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------------
 
@@ -430,6 +632,14 @@ if ($endUtc -gt $nowUtc) { $endUtc = $nowUtc }
 if ($endUtc -le $startUtc) { throw '-EndDate must be after -StartDate (and -StartDate must be in the past).' }
 $script:StartMs = ConvertTo-EpochMs -Date $startUtc
 $script:EndMs = ConvertTo-EpochMs -Date $endUtc
+$script:StartIso = Format-IsoUtc $startUtc
+$script:EndIso = Format-IsoUtc $endUtc
+$script:SearchMatchTypeValue = $SearchMatchType
+$script:SearchTextFieldValue = $SearchTextField
+$script:SearchDateFieldValue = $SearchDateField
+$script:SearchMediaTypeFieldValue = $SearchMediaTypeField
+$script:TempFolder = $env:TEMP
+if (-not $script:TempFolder) { $script:TempFolder = $OutputFolder }
 
 # --- Authentication
 if ($AccessToken) {
@@ -550,8 +760,85 @@ while ($nextIndex -lt $phraseList.Count -or $pending.Count -gt 0) {
     $pending = $stillPending
 }
 
+# --- Matched conversations: conversation id, phrase, detected transcript text
+$matchRows = @()
+$searchTotals = @{}
+if (-not $CountsOnly) {
+    if (-not (Test-Path -Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder | Out-Null }
+    $side = $Participants.ToLower()
+    Write-Host ''
+    Write-Host ('Finding matched conversations (transcript search, {0}, up to {1} per phrase)...' -f $SearchMatchType, $MaxMatchesPerPhrase)
+    $transcriptCache = @{}
+    $pi = 0
+    foreach ($phrase in $phraseList) {
+        $pi++
+        $search = $null
+        try { $search = Search-PhraseTranscripts -Phrase $phrase -Max $MaxMatchesPerPhrase }
+        catch {
+            Write-Warning ('[{0}/{1}] transcript search failed for "{2}": {3}' -f $pi, $phraseList.Count, $phrase, $_.Exception.Message)
+            if ($_.Exception.Message -like '*HTTP 400*') {
+                Write-Warning 'HTTP 400 from transcript search usually means a field name is wrong: see -SearchTextField / -SearchDateField / -SearchMediaTypeField.'
+            }
+            $searchTotals[$phrase.ToLower()] = 'error'
+            continue
+        }
+        $searchTotals[$phrase.ToLower()] = [string]$search.Total
+        Write-Host ('[{0}/{1}] {2} search hits (pulling {3})  "{4}"' -f $pi, $phraseList.Count, $search.Total, $search.Hits.Count, $phrase)
+        $phraseWords = @(Get-Words $phrase)
+        foreach ($h in $search.Hits) {
+            $convId = [string](Get-Prop $h @('conversationId', 'conversation.id', 'conversation_id'))
+            $commId = [string](Get-Prop $h @('communicationId', 'communication.id', 'communication_id'))
+            $convStart = [string](Get-Prop $h @('conversationStartTime', 'startTime', 'conversationStart'))
+            $row = @{
+                Phrase             = $phrase
+                ConversationId     = $convId
+                ConversationStart  = ''
+                CommunicationId    = $commId
+                Speaker            = ''
+                DetectedTranscript = ''
+                MatchScorePct      = ''
+                OffsetSec          = ''
+                Error              = ''
+            }
+            if ($convStart) { try { $row.ConversationStart = Format-Local ([datetime]$convStart) } catch { $row.ConversationStart = $convStart } }
+            if (-not $convId) {
+                $row.Error = 'Search hit had no conversation id'
+                $matchRows += , $row
+                continue
+            }
+            $key = $convId + '|' + $commId
+            if (-not $transcriptCache.ContainsKey($key)) { $transcriptCache[$key] = Get-TranscriptForHit -ConversationId $convId -CommunicationId $commId }
+            $tr = $transcriptCache[$key]
+            if (-not $row.CommunicationId) { $row.CommunicationId = $tr.CommunicationId }
+            if ($null -eq $tr.Transcript) {
+                $row.Error = $tr.Error
+            }
+            else {
+                $best = Find-BestSentence -Transcript $tr.Transcript -PhraseWords $phraseWords -Side $side
+                if ($best.Score -ge $MinMatchScore) {
+                    $row.Speaker = $best.Speaker
+                    $row.DetectedTranscript = $best.Text
+                    $row.MatchScorePct = [string]$best.Score
+                    $row.OffsetSec = $best.OffsetSec
+                }
+                elseif ($best.Score -ge 0) {
+                    $row.Error = ('Best sentence only {0}% similar (below -MinMatchScore {1}): {2}' -f $best.Score, $MinMatchScore, $best.Text)
+                }
+                else {
+                    $row.Error = ('No {0} sentences in transcript' -f $side)
+                }
+            }
+            $matchRows += , $row
+        }
+    }
+}
+
 # --- Output
-$columns = @('Phrase', 'MatchedTranscripts', 'ProcessedTranscripts', 'MatchPct', 'State', 'SecondsToComplete', 'JobId', 'Error')
+foreach ($r in $results) {
+    $k = $r.Phrase.ToLower()
+    if ($searchTotals.ContainsKey($k)) { $r.SearchHits = $searchTotals[$k] } else { $r.SearchHits = '' }
+}
+$columns = @('Phrase', 'MatchedTranscripts', 'ProcessedTranscripts', 'MatchPct', 'SearchHits', 'State', 'SecondsToComplete', 'JobId', 'Error')
 $rows = @(foreach ($r in $results) { New-Object PSObject -Property $r })
 
 # Sort: most matches first, then by phrase.
@@ -562,10 +849,23 @@ $n = Get-Date
 $stamp = (Get-Padded $n.Year 4) + (Get-Padded $n.Month 2) + (Get-Padded $n.Day 2) + '_' + (Get-Padded $n.Hour 2) + (Get-Padded $n.Minute 2) + (Get-Padded $n.Second 2)
 $csvPath = Join-Path -Path $OutputFolder -ChildPath ('TopicPhraseTest_' + $stamp + '.csv')
 $sorted | Select-Object $columns | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+$matchPath = ''
+if (-not $CountsOnly) {
+    $matchPath = Join-Path -Path $OutputFolder -ChildPath ('TopicPhraseMatches_' + $stamp + '.csv')
+    $matchColumns = @('Phrase', 'ConversationId', 'ConversationStart', 'Speaker', 'DetectedTranscript', 'MatchScorePct', 'OffsetSec', 'CommunicationId', 'Error')
+    @(foreach ($m in $matchRows) { New-Object PSObject -Property $m }) | Select-Object $matchColumns |
+        Export-Csv -Path $matchPath -NoTypeInformation -Encoding UTF8
+}
 
 Write-Host ''
 Write-Host '================ Topic phrase test results ================'
 $sorted | Select-Object MatchedTranscripts, ProcessedTranscripts, MatchPct, State, Phrase | Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host
 $failed = @($rows | Where-Object { $_.Error })
 if ($failed.Count -gt 0) { Write-Warning ('{0} phrase(s) did not complete; see the Error column.' -f $failed.Count) }
-Write-Host ('CSV: {0}' -f $csvPath)
+if (-not $CountsOnly) {
+    $found = @($matchRows | Where-Object { $_.DetectedTranscript }).Count
+    Write-Host ('Matched conversations: {0} with a detected sentence, {1} rows in total (see the Error column for the rest).' -f $found, $matchRows.Count)
+    Write-Host 'Note: SearchHits / matches come from wording-based transcript search; MatchedTranscripts is Genesys''s semantic count, so they will differ.'
+}
+Write-Host ('Counts CSV : {0}' -f $csvPath)
+if ($matchPath) { Write-Host ('Matches CSV: {0}' -f $matchPath) }

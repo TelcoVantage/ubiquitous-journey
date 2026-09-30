@@ -3,23 +3,50 @@
 | Script | What it does |
 |---|---|
 | `Get-IvrHangupCallbackRate.ps1` | IVR "hang up and call back" success rate (see below) |
-| `Test-TopicPhrases.ps1` | Runs the Speech & Text Analytics **test phrase** job for a list of candidate topic phrases and reports how many transcripts each one matches |
+| `Test-TopicPhrases.ps1` | Runs the Speech & Text Analytics **test phrase** job for a list of candidate topic phrases, reports how many transcripts each one matches, and lists matched conversations with the detected transcript sentence |
 
 ## Test-TopicPhrases.ps1
 
-Same thing as *Topic > Add phrase > Test* in the Genesys UI, for a whole list of phrases at once. For each phrase it calls `POST /api/v2/speechandtextanalytics/topics/testphrase/jobs` with the same body the UI sends, polls `GET .../jobs/{jobId}` until the job finishes, and records `matchedTranscriptsCount` / `processedTranscriptsCount`.
+Does what *Topic > Add phrase > Test* does in the Genesys UI, for a whole list of phrases at once, and also lists the conversations each phrase matched.
 
-**CONFIG block** (top of the script): region, client id/secret, the program IDs, the phrase list, and the topic settings (dialect `en-AU`, `Semantic`, participants `Internal`, strictness 72, media type `call`, last 29 days). Anything passed on the command line overrides it. The OAuth client needs `speechAndTextAnalytics:topic:testPhrase`.
+**1. Semantic counts (same as the UI).** For each phrase the script calls `POST /api/v2/speechandtextanalytics/topics/testphrase/jobs` with the same body the UI sends. It polls `GET .../jobs/{jobId}` until the job finishes and records `matchedTranscriptsCount` / `processedTranscriptsCount`.
+
+**2. Matched conversations.** Genesys only publishes a test job's per-conversation detail (conversation ID, snippet, confidence) on a WebSocket notification (`v2.speechandtextanalytics.topics.testphrase.jobs.{id}`), and Constrained Language Mode can't open a WebSocket. So for each phrase the script:
+- runs `POST /api/v2/speechandtextanalytics/transcripts/search`
+- downloads each hit's transcript (`GET .../conversations/{id}/communications/{id}/transcripturl`)
+- picks the sentence that best matches the phrase, on the side set by `-Participants` (`Internal` = agent)
+
+This matches **wording, not meaning**, so it finds fewer conversations than the semantic count. It won't catch paraphrases.
+
+**CONFIG block** (top of the script): region, client ID and secret, program IDs, the phrase list, and topic settings. The defaults are dialect `en-AU`, `Semantic` matching, participants `Internal`, strictness 72, media type `call`, and the last 29 days. Anything passed on the command line overrides these.
+
+**Permissions** for the OAuth client role:
+- `speechAndTextAnalytics:topic:testPhrase`
+- `analytics:conversationDetail:view`
+- `recording:recording:view`
+- `speechAndTextAnalytics:data:view`
 
 ```powershell
 .\Test-TopicPhrases.ps1                                             # everything from CONFIG
 .\Test-TopicPhrases.ps1 -StartDate '2026-09-01' -EndDate '2026-09-30' -Strictness 60
-.\Test-TopicPhrases.ps1 -PhraseFile .\phrases.txt -Participants Both -MatchingType Lexical
+.\Test-TopicPhrases.ps1 -MaxMatchesPerPhrase 100 -SearchMatchType EXACT_PHRASE
+.\Test-TopicPhrases.ps1 -CountsOnly                                 # skip the matched-conversation step
 ```
 
-Output: `TopicPhraseTest_<stamp>.csv` with `Phrase, MatchedTranscripts, ProcessedTranscripts, MatchPct, State, SecondsToComplete, JobId, Error`, sorted by matches, plus the same table on the console. Up to `-MaxConcurrentJobs` (default 3) jobs run at a time; a job that hasn't finished after `-JobTimeoutSeconds` (default 600) is reported with an error rather than blocking the rest.
+| Output | Columns |
+|---|---|
+| `TopicPhraseTest_<stamp>.csv` (one row per phrase) | `Phrase, MatchedTranscripts, ProcessedTranscripts, MatchPct, SearchHits, State, SecondsToComplete, JobId, Error` |
+| `TopicPhraseMatches_<stamp>.csv` (one row per conversation) | `Phrase, ConversationId, ConversationStart, Speaker, DetectedTranscript, MatchScorePct, OffsetSec, CommunicationId, Error` |
 
-The public API only exposes the match counts for a test job, not the transcript snippets the UI shows; use the UI for those once you've narrowed the list.
+- **`MatchScorePct`** is the percentage of the phrase's words found in the detected sentence (100 = verbatim, ignoring case and punctuation). Rows below `-MinMatchScore` (default 60) show the closest sentence in `Error` instead.
+- **`OffsetSec`** is how far into the call the sentence was said.
+
+**Transcript search field names are not verified.** Genesys doesn't publish them clearly, so the defaults are best guesses: `transcript.content`, `conversationStartTime` and `mediaType`. If the search returns HTTP 400 or 0 hits for phrases you know were said, change them with `-SearchTextField`, `-SearchDateField` and `-SearchMediaTypeField`.
+
+Other settings:
+- **Concurrency:** up to `-MaxConcurrentJobs` (default 3) test jobs run at a time.
+- **Timeout:** a job that hasn't finished after `-JobTimeoutSeconds` (default 600) is reported with an error rather than holding up the rest.
+- **Cost:** each matched conversation costs 2–3 API calls, capped at `-MaxMatchesPerPhrase` (default 25).
 
 ---
 
