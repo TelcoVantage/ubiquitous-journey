@@ -1,3 +1,28 @@
+# Genesys Cloud PowerShell scripts (Constrained Language Mode safe)
+
+| Script | What it does |
+|---|---|
+| `Get-IvrHangupCallbackRate.ps1` | IVR "hang up and call back" success rate (see below) |
+| `Test-TopicPhrases.ps1` | Runs the Speech & Text Analytics **test phrase** job for a list of candidate topic phrases and reports how many transcripts each one matches |
+
+## Test-TopicPhrases.ps1
+
+Same thing as *Topic > Add phrase > Test* in the Genesys UI, for a whole list of phrases at once. For each phrase it calls `POST /api/v2/speechandtextanalytics/topics/testphrase/jobs` with the same body the UI sends, polls `GET .../jobs/{jobId}` until the job finishes, and records `matchedTranscriptsCount` / `processedTranscriptsCount`.
+
+**CONFIG block** (top of the script): region, client id/secret, the program IDs, the phrase list, and the topic settings (dialect `en-AU`, `Semantic`, participants `Internal`, strictness 72, media type `call`, last 28 days). Anything passed on the command line overrides it. The OAuth client needs `speechAndTextAnalytics:topic:testPhrase`.
+
+```powershell
+.\Test-TopicPhrases.ps1                                             # everything from CONFIG
+.\Test-TopicPhrases.ps1 -StartDate '2026-09-01' -EndDate '2026-09-30' -Strictness 60
+.\Test-TopicPhrases.ps1 -PhraseFile .\phrases.txt -Participants Both -MatchingType Lexical
+```
+
+Output: `TopicPhraseTest_<stamp>.csv` with `Phrase, MatchedTranscripts, ProcessedTranscripts, MatchPct, State, SecondsToComplete, JobId, Error`, sorted by matches, plus the same table on the console. Up to `-MaxConcurrentJobs` (default 3) jobs run at a time; a job that hasn't finished after `-JobTimeoutSeconds` (default 600) is reported with an error rather than blocking the rest.
+
+The public API only exposes the match counts for a test job, not the transcript snippets the UI shows; use the UI for those once you've narrowed the list.
+
+---
+
 # IVR hang-up → authenticated callback success rate (Genesys Cloud)
 
 `Get-IvrHangupCallbackRate.ps1` measures how well the IVR message *"hang up and call back the authenticated way for faster service"* works. It checks:
