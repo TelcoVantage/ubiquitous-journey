@@ -41,7 +41,9 @@ This matches **wording, not meaning**, so it finds fewer conversations than the 
 - **`MatchScorePct`** is the percentage of the phrase's words found in the detected sentence (100 = verbatim, ignoring case and punctuation). Rows below `-MinMatchScore` (default 60) show the closest sentence in `Error` instead.
 - **`OffsetSec`** is how far into the call the sentence was said.
 
-**Transcript search field names are not verified.** Genesys doesn't publish them clearly, so the defaults are best guesses: `transcript.content`, `conversationStartTime` and `mediaType`. If the search returns HTTP 400 or 0 hits for phrases you know were said, change them with `-SearchTextField`, `-SearchDateField` and `-SearchMediaTypeField`.
+**Transcript search field names are only partly verified.** The API requires a `language` criterion (it returns `REQUIRED_SEARCH_FIELD: language` without one); the script sends `-SearchLanguage`, which defaults to the `-Dialect` value (`en-AU`). The other field names, `transcript.content`, `conversationStartTime` and `mediaType`, are best guesses. If the search returns HTTP 400 the warning names the rejected field; change it with `-SearchTextField`, `-SearchDateField`, `-SearchMediaTypeField` or `-SearchLanguage` (try `en-au` in lower case if hits are unexpectedly 0). After three consecutive search failures the step is skipped for the remaining phrases.
+
+**Sanity check the semantic counts.** Add a phrase agents definitely say (e.g. `thanks for calling`) to `$Phrases`. If even that comes back `matched 0`, the job settings (programs, dialect, participants, date window) are wrong rather than the phrases.
 
 Other settings:
 - **Concurrency:** up to `-MaxConcurrentJobs` (default 3) test jobs run at a time.

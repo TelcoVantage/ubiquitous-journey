@@ -147,6 +147,10 @@ param(
     [string]$SearchTextField = 'transcript.content',
     [string]$SearchDateField = 'conversationStartTime',
     [string]$SearchMediaTypeField = 'mediaType',
+    # The search REQUIRES a language criterion (REQUIRED_SEARCH_FIELD: language).
+    # Default: the -Dialect value. Try lower-case (en-au) if hits are unexpectedly 0.
+    [string]$SearchLanguageField = 'language',
+    [string]$SearchLanguage,
     # Minimum word overlap (%) between the phrase and a transcript sentence to report it.
     [ValidateRange(1, 100)]
     [int]$MinMatchScore = 60,
@@ -477,6 +481,7 @@ function Search-PhraseTranscripts {
         if ($size -gt 100) { $size = 100 }
         $query = @(
             @{ type = 'DATE_RANGE'; fields = @($script:SearchDateFieldValue); startValue = $script:StartIso; endValue = $script:EndIso; dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSX" },
+            @{ type = 'EXACT'; fields = @($script:SearchLanguageFieldValue); value = $script:SearchLanguageValue },
             @{ type = $script:SearchMatchTypeValue; fields = @($script:SearchTextFieldValue); value = $Phrase }
         )
         if ($script:MediaTypeValue -ne 'all') {
@@ -638,6 +643,9 @@ $script:SearchMatchTypeValue = $SearchMatchType
 $script:SearchTextFieldValue = $SearchTextField
 $script:SearchDateFieldValue = $SearchDateField
 $script:SearchMediaTypeFieldValue = $SearchMediaTypeField
+$script:SearchLanguageFieldValue = $SearchLanguageField
+$script:SearchLanguageValue = $SearchLanguage
+if (-not $script:SearchLanguageValue) { $script:SearchLanguageValue = $Dialect }
 $script:TempFolder = $env:TEMP
 if (-not $script:TempFolder) { $script:TempFolder = $OutputFolder }
 
@@ -660,7 +668,7 @@ else {
 }
 
 Write-Host ''
-Write-Host ('Transcripts (local) : {0}  ->  {1}   mediaType={2}' -f (Format-Local $startUtc), (Format-Local $endUtc), $MediaType)
+Write-Host ('Transcripts (local) : {0}  ->  {1}   mediaType={2}   search language={3}' -f (Format-Local $startUtc), (Format-Local $endUtc), $MediaType, $script:SearchLanguageValue)
 Write-Host ('Programs            : {0}' -f ($script:ProgramList -join ', '))
 if ($script:QueueList.Count -gt 0) { Write-Host ('Queues              : {0}' -f ($script:QueueList -join ', ')) }
 if ($script:FlowList.Count -gt 0) { Write-Host ('Flows               : {0}' -f ($script:FlowList -join ', ')) }
@@ -769,6 +777,7 @@ if (-not $CountsOnly) {
     Write-Host ''
     Write-Host ('Finding matched conversations (transcript search, {0}, up to {1} per phrase)...' -f $SearchMatchType, $MaxMatchesPerPhrase)
     $transcriptCache = @{}
+    $searchFailures = 0
     $pi = 0
     foreach ($phrase in $phraseList) {
         $pi++
@@ -777,11 +786,23 @@ if (-not $CountsOnly) {
         catch {
             Write-Warning ('[{0}/{1}] transcript search failed for "{2}": {3}' -f $pi, $phraseList.Count, $phrase, $_.Exception.Message)
             if ($_.Exception.Message -like '*HTTP 400*') {
-                Write-Warning 'HTTP 400 from transcript search usually means a field name is wrong: see -SearchTextField / -SearchDateField / -SearchMediaTypeField.'
+                $msg = [string]$_.Exception.Message
+                if ($msg -match '"errorCode"\s*:\s*"([A-Z_]+)"\s*,\s*"fieldName"\s*:\s*"([^"]+)"') {
+                    Write-Warning ('Transcript search rejected the query: {0} on field "{1}". Adjust the matching -Search*Field / -SearchLanguage parameter.' -f $matches[1], $matches[2])
+                }
+                else {
+                    Write-Warning 'HTTP 400 from transcript search usually means a field name or value is wrong: see -SearchTextField / -SearchDateField / -SearchMediaTypeField / -SearchLanguage.'
+                }
+                if ($searchFailures -ge 2) {
+                    Write-Warning 'Transcript search failed for 3 phrases in a row; skipping the matched-conversation step for the remaining phrases.'
+                    break
+                }
+                $searchFailures++
             }
             $searchTotals[$phrase.ToLower()] = 'error'
             continue
         }
+        $searchFailures = 0
         $searchTotals[$phrase.ToLower()] = [string]$search.Total
         Write-Host ('[{0}/{1}] {2} search hits (pulling {3})  "{4}"' -f $pi, $phraseList.Count, $search.Total, $search.Hits.Count, $phrase)
         $phraseWords = @(Get-Words $phrase)
@@ -853,8 +874,14 @@ $matchPath = ''
 if (-not $CountsOnly) {
     $matchPath = Join-Path -Path $OutputFolder -ChildPath ('TopicPhraseMatches_' + $stamp + '.csv')
     $matchColumns = @('Phrase', 'ConversationId', 'ConversationStart', 'Speaker', 'DetectedTranscript', 'MatchScorePct', 'OffsetSec', 'CommunicationId', 'Error')
-    @(foreach ($m in $matchRows) { New-Object PSObject -Property $m }) | Select-Object $matchColumns |
-        Export-Csv -Path $matchPath -NoTypeInformation -Encoding UTF8
+    if ($matchRows.Count -gt 0) {
+        @(foreach ($m in $matchRows) { New-Object PSObject -Property $m }) | Select-Object $matchColumns |
+            Export-Csv -Path $matchPath -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        # Export-Csv with no rows writes only a byte-order mark, which Excel shows as "ï»¿".
+        Set-Content -Path $matchPath -Value ('"' + ($matchColumns -join '","') + '"') -Encoding UTF8
+    }
 }
 
 Write-Host ''
