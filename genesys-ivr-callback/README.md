@@ -9,7 +9,7 @@
 
 Same thing as *Topic > Add phrase > Test* in the Genesys UI, for a whole list of phrases at once. For each phrase it calls `POST /api/v2/speechandtextanalytics/topics/testphrase/jobs` with the same body the UI sends, polls `GET .../jobs/{jobId}` until the job finishes, and records `matchedTranscriptsCount` / `processedTranscriptsCount`.
 
-**CONFIG block** (top of the script): region, client id/secret, the program IDs, the phrase list, and the topic settings (dialect `en-AU`, `Semantic`, participants `Internal`, strictness 72, media type `call`, last 28 days). Anything passed on the command line overrides it. The OAuth client needs `speechAndTextAnalytics:topic:testPhrase`.
+**CONFIG block** (top of the script): region, client id/secret, the program IDs, the phrase list, and the topic settings (dialect `en-AU`, `Semantic`, participants `Internal`, strictness 72, media type `call`, last 29 days). Anything passed on the command line overrides it. The OAuth client needs `speechAndTextAnalytics:topic:testPhrase`.
 
 ```powershell
 .\Test-TopicPhrases.ps1                                             # everything from CONFIG

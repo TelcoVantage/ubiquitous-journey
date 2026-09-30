@@ -88,10 +88,10 @@ param(
     [ValidateRange(1, 100)]
     [int]$Strictness = 72,
 
-    # Transcript filters. The UI default window is the last 28 days.
+    # Transcript filters. The UI default window is the last 29 days.
     [ValidateSet('call', 'chat', 'email', 'message', 'all')]
     [string]$MediaType = 'call',
-    [datetime]$StartDate = (Get-Date).AddDays(-28),
+    [datetime]$StartDate = (Get-Date).AddDays(-29),
     [datetime]$EndDate = (Get-Date),
     [string[]]$QueueIds = @(),
     [string[]]$FlowIds = @(),
