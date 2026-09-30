@@ -13,7 +13,7 @@ Does what *Topic > Add phrase > Test* does in the Genesys UI, for a whole list o
 
 **2. Matched conversations (the exact list the UI shows).** Genesys publishes a test job's per-conversation detail (conversation ID, found phrase, snippet, confidence) only on the notification topic `v2.speechandtextanalytics.topics.testphrase.jobs.{jobId}`, over a WebSocket. .NET WebSockets are blocked in Constrained Language Mode, so the script:
 - creates a notification channel (`POST /api/v2/notifications/channels`)
-- starts Windows' built-in **`curl.exe`** as a child process to read the channel's WebSocket into a file (curl 8.11+ has WebSocket support; Windows 11 and Server 2025 ship it, check `curl.exe -V` lists `WebSockets` under Features)
+- starts Windows' built-in **`curl.exe`** as a child process to read the channel's WebSocket into a file (curl 8.11+ has WebSocket support: `curl.exe -V` lists `ws wss` on its Protocols line)
 - subscribes each job's topic as it is submitted, and parses the frames curl writes
 
 If curl lacks WebSocket support, or the channel can't be opened, the script says so and still reports the counts. `-ProxyUrl http://proxy:8080` if curl needs a proxy (it does not pick up the Windows system proxy). `-KeepListenerLog` keeps the raw frames file for troubleshooting.

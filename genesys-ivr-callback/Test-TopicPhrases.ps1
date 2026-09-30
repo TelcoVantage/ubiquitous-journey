@@ -493,8 +493,17 @@ function Test-CurlWebSocket {
     catch { return @{ Ok = $false; Reason = ('could not run "{0}": {1}' -f $script:CurlPathValue, $_.Exception.Message); Version = '' } }
     $version = ''
     if ($text -match 'curl\s+(\d+\.\d+(\.\d+)?)') { $version = $matches[1] }
-    if ($text -notmatch '(?i)websocket') {
-        return @{ Ok = $false; Version = $version; Reason = ('curl {0} at "{1}" was built without WebSocket support (needs curl 8.11 or later; check "curl.exe -V" lists WebSockets under Features)' -f $version, $script:CurlPathValue) }
+    # curl advertises WebSocket support as "ws wss" on the Protocols line (8.11+), and
+    # older experimental builds as "WebSockets" on the Features line.
+    $protoLine = ''
+    $featLine = ''
+    foreach ($line in ($text -split "`r?`n")) {
+        if ($line -match '^\s*Protocols:') { $protoLine = $line.Trim() }
+        elseif ($line -match '^\s*Features:') { $featLine = $line.Trim() }
+    }
+    $hasWs = ($protoLine -match '(?i)(^|\s)wss?(\s|$)') -or ($featLine -match '(?i)websocket')
+    if (-not $hasWs) {
+        return @{ Ok = $false; Version = $version; Reason = ('curl {0} at "{1}" reports no WebSocket support. It reported: [{2}] [{3}]. Needs curl 8.11+ built with WebSockets (ws/wss on the Protocols line); point -CurlPath at such a build' -f $version, $script:CurlPathValue, $protoLine, $featLine) }
     }
     return @{ Ok = $true; Version = $version; Reason = '' }
 }
