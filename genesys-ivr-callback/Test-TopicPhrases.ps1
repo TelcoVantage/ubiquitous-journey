@@ -155,6 +155,8 @@ param(
     [int]$ListenerMaxSeconds = 3600,
     # Keep the raw notification frames file (troubleshooting).
     [switch]$KeepListenerLog,
+    # Save the raw GET .../jobs/{jobId} JSON of each finished job to the output folder.
+    [switch]$DumpJobJson,
 
     # --- Optional extra: wording-based transcript search (writes TopicPhraseSearch_*.csv) ---
     # Finds calls whose transcript contains the phrase's WORDING via
@@ -817,6 +819,7 @@ $script:KeepListenerLogValue = [bool]$KeepListenerLog
 $script:ListenerProc = $null
 $script:ChannelId = ''
 $script:JobResults = @{}
+$script:InlineResults = $false
 $rs = Get-Date
 $script:RunStamp = (Get-Padded $rs.Year 4) + (Get-Padded $rs.Month 2) + (Get-Padded $rs.Day 2) + '_' + (Get-Padded $rs.Hour 2) + (Get-Padded $rs.Minute 2) + (Get-Padded $rs.Second 2)
 if (-not (Test-Path -Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder | Out-Null }
@@ -941,6 +944,19 @@ while ($nextIndex -lt $phraseList.Count -or $pending.Count -gt 0) {
         if (Test-JobFinished -State $state) {
             $row.SecondsToComplete = [string]([int]$elapsed)
             $row.FinishedAt = Get-Date
+            if ($DumpJobJson) {
+                $dumpPath = Join-Path -Path $OutputFolder -ChildPath ('job_' + $p.JobId + '.json')
+                ConvertTo-Json -InputObject $status -Depth 20 | Set-Content -Path $dumpPath -Encoding UTF8
+            }
+            # If Genesys ever includes the matched transcripts in the GET response, use them.
+            $inline = @()
+            foreach ($res in @($status.testTopicPhraseResults)) { foreach ($t in @($res.matchedTranscripts)) { if ($null -ne $t) { $inline += , $t } } }
+            foreach ($t in @($status.matchedTranscripts)) { if ($null -ne $t) { $inline += , $t } }
+            if ($inline.Count -gt 0) {
+                if (-not $script:JobResults.ContainsKey($p.JobId)) { $script:JobResults[$p.JobId] = @{ State = $state; Transcripts = @(); Notifications = 0 } }
+                $script:JobResults[$p.JobId].Transcripts = $inline
+                $script:InlineResults = $true
+            }
             if (Test-JobFailed -State $state) {
                 $row.Error = ('Job ended in state {0}' -f $state)
                 Write-Warning ('job {0} "{1}" ended in state {2}' -f $p.JobId, $p.Phrase, $state)
@@ -972,8 +988,8 @@ while ($nextIndex -lt $phraseList.Count -or $pending.Count -gt 0) {
 
 # --- Wait for the notifications of finished jobs, then build the matched-conversation rows
 $matchRows = @()
-if ($listening) {
-    while ($true) {
+if ($listening -or $script:InlineResults) {
+    while ($listening) {
         Read-JobNotifications
         $waiting = @(foreach ($r in $results) {
                 if (-not $r.JobId -or $null -eq $r.FinishedAt -or $r.Error) { continue }
@@ -997,7 +1013,7 @@ if ($listening) {
         if ($script:JobResults.ContainsKey($r.JobId)) { $entry = $script:JobResults[$r.JobId] }
         if ($null -eq $entry) {
             $r.MatchedConversationsReceived = '0'
-            if ($r.MatchedTranscripts -ne '' -and [int]$r.MatchedTranscripts -gt 0 -and -not $r.Error) {
+            if ($listening -and $r.MatchedTranscripts -ne '' -and [int]$r.MatchedTranscripts -gt 0 -and -not $r.Error) {
                 $r.Error = ('No notification received within {0}s of the job finishing' -f $NotificationWaitSeconds)
             }
             continue
@@ -1145,7 +1161,7 @@ $stamp = $script:RunStamp
 $csvPath = Join-Path -Path $OutputFolder -ChildPath ('TopicPhraseTest_' + $stamp + '.csv')
 $sorted | Select-Object $columns | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 $matchPath = ''
-if ($listening) {
+if ($listening -or $script:InlineResults) {
     $matchPath = Join-Path -Path $OutputFolder -ChildPath ('TopicPhraseMatches_' + $stamp + '.csv')
     $matchColumns = @('Phrase', 'ConversationId', 'ConversationTime', 'MediaType', 'FoundPhrase', 'Snippet', 'Confidence', 'CommunicationId', 'TranscriptId', 'JobId')
     $sortedMatches = @($matchRows | Sort-Object { $_.Phrase }, { $_.ConversationTime })
@@ -1163,7 +1179,7 @@ Write-Host '================ Topic phrase test results ================'
 $sorted | Select-Object MatchedTranscripts, MatchedConversationsReceived, ProcessedTranscripts, MatchPct, State, Phrase | Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host
 $failed = @($rows | Where-Object { $_.Error })
 if ($failed.Count -gt 0) { Write-Warning ('{0} phrase(s) have an error; see the Error column.' -f $failed.Count) }
-if ($listening) {
+if ($listening -or $script:InlineResults) {
     $convCount = @($matchRows | ForEach-Object { $_.ConversationId } | Sort-Object -Unique).Count
     Write-Host ('Matched conversations received from Genesys: {0} rows, {1} distinct conversations.' -f $matchRows.Count, $convCount)
     if ($script:KeepListenerLogValue) { Write-Host ('Raw notification frames: {0}' -f $script:ListenerOut) }
