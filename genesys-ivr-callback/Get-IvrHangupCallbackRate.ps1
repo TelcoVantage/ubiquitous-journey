@@ -45,18 +45,31 @@
 #>
 [CmdletBinding()]
 param(
+    # ==============================================================================
+    # CONFIG - fill these in. Anything passed on the command line overrides them.
+    # Do not commit a real client secret to source control.
+    # ==============================================================================
+
     # Region domain: mypurecloud.com, mypurecloud.ie, mypurecloud.de, mypurecloud.com.au,
     # mypurecloud.jp, usw2.pure.cloud, cac1.pure.cloud, euw2.pure.cloud, aps1.pure.cloud, ...
     [string]$Environment = 'mypurecloud.com',
 
-    # Client Credentials OAuth client. Secret falls back to $env:GC_CLIENT_SECRET, then a prompt.
-    [string]$ClientId = $env:GC_CLIENT_ID,
-    [string]$ClientSecret,
+    # Client Credentials OAuth client.
+    [string]$ClientId = 'PASTE-CLIENT-ID-HERE',
+    [string]$ClientSecret = 'PASTE-CLIENT-SECRET-HERE',
+
+    # The two inbound call flows that play the "hang up and call back" message.
+    [string[]]$SourceFlowIds = @(
+        'PASTE-FLOW-1-ID-HERE',
+        'PASTE-FLOW-2-ID-HERE'
+    ),
+
+    # ==============================================================================
+    # END OF CONFIG
+    # ==============================================================================
+
     # Or an existing bearer token (skips OAuth).
     [string]$AccessToken,
-
-    # The inbound call flows that play the "hang up and call back" message.
-    [string[]]$SourceFlowIds,
     [string[]]$SourceFlowNames,
 
     # Reporting period for the first (hung-up) call. Local machine time unless the value
@@ -68,6 +81,9 @@ param(
     [int]$CallbackWindowMinutes = 30,
 
     # --- "Authenticated way" criteria for the callback (all optional) ---
+    # With none of these set, a callback counts when the same number calls one of the
+    # source flows again (any DNIS). Use -AnyCallback to count calls to any flow.
+    [switch]$AnyCallback,
     [string[]]$CallbackFlowIds,
     [string[]]$CallbackFlowNames,
     [string[]]$CallbackDnis,
@@ -737,8 +753,13 @@ $nowUtc = (Get-Date).ToUniversalTime()
 if ($endUtc -gt $nowUtc) { $endUtc = $nowUtc }
 if ($endUtc -le $startUtc) { throw '-EndDate must be after -StartDate (and -StartDate must be in the past).' }
 
+# Drop config placeholders that were never filled in.
+$SourceFlowIds = @(foreach ($id in @(Get-CleanList -Values $SourceFlowIds -SplitCommas)) { if ($id -notlike 'PASTE-*') { $id } })
+if ($ClientId -like 'PASTE-*') { $ClientId = $env:GC_CLIENT_ID }
+if ($ClientSecret -like 'PASTE-*') { $ClientSecret = '' }
+
 if (@(Get-CleanList -Values $SourceFlowIds).Count -eq 0 -and @(Get-CleanList -Values $SourceFlowNames).Count -eq 0) {
-    throw 'Supply the flows that play the message with -SourceFlowIds and/or -SourceFlowNames.'
+    throw 'Fill in $SourceFlowIds in the CONFIG block at the top of the script (or pass -SourceFlowIds / -SourceFlowNames).'
 }
 
 # --- Authentication
@@ -746,7 +767,7 @@ if ($AccessToken) {
     $script:ApiHeaders = @{ Authorization = ('Bearer ' + $AccessToken.Trim()) }
 }
 else {
-    if (-not $ClientId) { throw 'Supply -ClientId (or $env:GC_CLIENT_ID), or -AccessToken.' }
+    if (-not $ClientId) { throw 'Fill in $ClientId in the CONFIG block at the top of the script (or pass -ClientId / -AccessToken).' }
     if (-not $ClientSecret) { $ClientSecret = $env:GC_CLIENT_SECRET }
     if (-not $ClientSecret) {
         $cred = Get-Credential -UserName $ClientId -Message 'Genesys Cloud OAuth client secret (enter it as the password)'
@@ -771,6 +792,11 @@ $msgOutcomeKey = ([string]$MessageOutcomeId).Trim().ToLower()
 $authAttrName = ([string]$AuthAttributeName).Trim()
 $hasRoute = ($routeFlowSet.Count -gt 0 -or $routeDnisKeys.Count -gt 0)
 $hasProof = ([bool]$authOutcomeKey -or [bool]$authAttrName)
+# Default: a callback counts when it comes back into one of the source flows (any DNIS).
+if (-not $hasRoute -and -not $hasProof -and -not $AnyCallback) {
+    foreach ($fid in $script:SourceFlowSet.Keys) { $routeFlowSet[$fid] = $script:SourceFlowSet[$fid] }
+    $hasRoute = $true
+}
 
 Write-Host ''
 Write-Host ('Period (local)   : {0}  ->  {1}' -f (Format-Local $startUtc), (Format-Local $endUtc))
@@ -788,7 +814,7 @@ if ($hasRoute -or $hasProof) {
     Write-Host ('Qualified if     : {0}' -f ($crit -join '; '))
 }
 else {
-    Write-Warning 'No authenticated-route criteria supplied (-CallbackDnis / -CallbackFlowIds / -CallbackFlowNames / -AuthOutcomeId / -AuthAttributeName): ANY callback from the same number counts as qualified.'
+    Write-Warning '-AnyCallback: ANY inbound call from the same number counts as qualified, whichever flow it reached.'
 }
 Write-Host ''
 
@@ -1108,7 +1134,9 @@ foreach ($r in $summaryRows) {
     Write-Host ('  Called back within {0} min (any)   : {1} ({2}%)' -f $CallbackWindowMinutes, $r.CalledBackAny, $r.CalledBackAnyPct)
     Write-Host ('  Called back QUALIFIED (success)   : {0} ({1}%)' -f $r.CalledBackQualified, $r.QualifiedSuccessRatePct)
     Write-Host ('  Called back, other route only     : {0}' -f $r.CalledBackNotQualifiedOnly)
-    Write-Host ('  Qualified callbacks answered      : {0} ({1}%), median wait {2}s' -f $r.QualifiedAnsweredByAgent, $r.QualifiedAnsweredPct, $r.MedianQualifiedAnswerWaitSec)
+    $waitText = 'n/a'
+    if ($r.MedianQualifiedAnswerWaitSec) { $waitText = $r.MedianQualifiedAnswerWaitSec + 's' }
+    Write-Host ('  Qualified callbacks answered      : {0} ({1}%), median wait {2}' -f $r.QualifiedAnsweredByAgent, $r.QualifiedAnsweredPct, $waitText)
     Write-Host ('  Minutes to qualified callback     : avg {0}, median {1}' -f $r.AvgMinutesToQualifiedCallback, $r.MedianMinutesToQualifiedCallback)
     Write-Host ('  Unique callers qualified          : {0} of {1} ({2}%)' -f $r.UniqueCallersQualified, $r.UniqueCallers, $r.UniqueCallerQualifiedPct)
 }

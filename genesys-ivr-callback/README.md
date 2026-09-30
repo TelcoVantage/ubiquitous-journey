@@ -18,14 +18,32 @@ The script is safe to run in **Constrained Language Mode** (Windows PowerShell 5
 
 **Headline KPI:** `QualifiedSuccessRatePct` = eligible hang-ups followed by a qualified callback within the window ÷ eligible hang-ups.
 
-### What counts as "the authenticated way"
+### Quick start: fill in the CONFIG block
 
-The criteria are optional and fall into two groups:
+The top of the script's `param(...)` block has a **CONFIG** section. Paste your values there and run the script with no arguments:
+
+```powershell
+[string]$Environment = 'mypurecloud.com.au',
+[string]$ClientId = '<your client id>',
+[string]$ClientSecret = '<your client secret>',
+[string[]]$SourceFlowIds = @(
+    '<flow 1 id>',
+    '<flow 2 id>'
+),
+```
+
+Anything you pass on the command line overrides the CONFIG values. Keep the real secret out of source control: fill it in on your machine only, or leave the placeholder and set `$env:GC_CLIENT_SECRET`.
+
+### What counts as a successful callback
+
+**Default (no criteria passed):** a callback counts when the **same number calls one of the source flows again** within the window, **on any DNIS**. Calls from that number to other flows show up as `CalledBackNotQualified`. Pass `-AnyCallback` to count a call to **any** flow.
+
+You can tighten this with optional criteria, which fall into two groups:
 
 - **Route**: the callback went through `-CallbackFlowIds` / `-CallbackFlowNames`, **or** it dialled `-CallbackDnis`.
 - **Proof**: the callback reached flow outcome `-AuthOutcomeId` with value `SUCCESS`, **or** it has participant data `-AuthAttributeName` (optionally equal to `-AuthAttributeValue`).
 
-A callback is **qualified** when it matches **route AND proof**. A group you supply no criteria for is ignored. If you supply no criteria at all, every callback counts, and the script warns you about this.
+A callback is **qualified** when it matches **route AND proof**. A group you supply no criteria for is ignored.
 
 Pick the criteria that match how your authenticated path works:
 
@@ -60,14 +78,20 @@ These calls are always excluded and are listed in the detail CSV with an `Exclud
    - `conversation:communication:view` if you use `-AuthAttributeName`
    - access to the divisions your flows and queues are in
 2. **Region**: pass `-Environment`, for example `mypurecloud.com`, `mypurecloud.ie`, `mypurecloud.de`, `mypurecloud.com.au`, `mypurecloud.jp`, `usw2.pure.cloud`, `euw2.pure.cloud` or `aps1.pure.cloud`.
-3. **Secret**: pass `-ClientSecret`, or set `$env:GC_CLIENT_ID` / `$env:GC_CLIENT_SECRET`. If you pass neither, you get a `Get-Credential` prompt; enter the secret as the password. You can also pass `-AccessToken` to skip OAuth.
+3. **Credentials and flows**: fill in the CONFIG block (see Quick start), or pass `-ClientId` / `-ClientSecret` / `-SourceFlowIds`. If the secret is left as the placeholder, the script uses `$env:GC_CLIENT_SECRET`, then shows a `Get-Credential` prompt; enter the secret as the password. You can also pass `-AccessToken` to skip OAuth.
 
 ## Examples
 
 ```powershell
-# Basic: any callback within 30 min counts
+# CONFIG block filled in: callbacks into the same two flows within 30 min, last 7 days
+.\Get-IvrHangupCallbackRate.ps1
+
+# Same, for a given period
+.\Get-IvrHangupCallbackRate.ps1 -StartDate '2026-09-01' -EndDate '2026-09-08'
+
+# Any callback within 30 min counts, whichever flow it reached
 .\Get-IvrHangupCallbackRate.ps1 -Environment mypurecloud.com.au -ClientId $id -ClientSecret $secret `
-    -SourceFlowNames 'Main Inbound','Billing Inbound' -StartDate '2026-09-01' -EndDate '2026-09-08'
+    -SourceFlowNames 'Main Inbound','Billing Inbound' -AnyCallback -StartDate '2026-09-01' -EndDate '2026-09-08'
 
 # Success = called back within 30 min on the authenticated number AND passed ID&V,
 # counting only callers who heard the message and hung up themselves
