@@ -11,37 +11,39 @@ Does what *Topic > Add phrase > Test* does in the Genesys UI, for a whole list o
 
 **1. Semantic counts (same as the UI).** For each phrase the script calls `POST /api/v2/speechandtextanalytics/topics/testphrase/jobs` with the same body the UI sends. It polls `GET .../jobs/{jobId}` until the job finishes and records `matchedTranscriptsCount` / `processedTranscriptsCount`.
 
-**2. Matched conversations.** Genesys only publishes a test job's per-conversation detail (conversation ID, snippet, confidence) on a WebSocket notification (`v2.speechandtextanalytics.topics.testphrase.jobs.{id}`), and Constrained Language Mode can't open a WebSocket. So for each phrase the script:
-- runs `POST /api/v2/speechandtextanalytics/transcripts/search`
-- downloads each hit's transcript (`GET .../conversations/{id}/communications/{id}/transcripturl`)
-- picks the sentence that best matches the phrase, on the side set by `-Participants` (`Internal` = agent)
+**2. Matched conversations (the exact list the UI shows).** Genesys publishes a test job's per-conversation detail (conversation ID, found phrase, snippet, confidence) only on the notification topic `v2.speechandtextanalytics.topics.testphrase.jobs.{jobId}`, over a WebSocket. .NET WebSockets are blocked in Constrained Language Mode, so the script:
+- creates a notification channel (`POST /api/v2/notifications/channels`)
+- starts Windows' built-in **`curl.exe`** as a child process to read the channel's WebSocket into a file (curl 8.11+ has WebSocket support; Windows 11 and Server 2025 ship it, check `curl.exe -V` lists `WebSockets` under Features)
+- subscribes each job's topic as it is submitted, and parses the frames curl writes
 
-This matches **wording, not meaning**, so it finds fewer conversations than the semantic count. It won't catch paraphrases.
+If curl lacks WebSocket support, or the channel can't be opened, the script says so and still reports the counts. `-ProxyUrl http://proxy:8080` if curl needs a proxy (it does not pick up the Windows system proxy). `-KeepListenerLog` keeps the raw frames file for troubleshooting.
+
+**3. Optional, `-TranscriptSearch`:** a wording-based list of conversations from the transcript search API, written to a separate `TopicPhraseSearch_*.csv`. It matches wording rather than meaning, so it is not the same list as step 2.
 
 **CONFIG block** (top of the script): region, client ID and secret, program IDs, the phrase list, and topic settings. The defaults are dialect `en-AU`, `Semantic` matching, participants `Internal`, strictness 72, media type `call`, and the last 29 days. Anything passed on the command line overrides these.
 
 **Permissions** for the OAuth client role:
-- `speechAndTextAnalytics:topic:testPhrase`
-- `analytics:conversationDetail:view`
-- `recording:recording:view`
-- `speechAndTextAnalytics:data:view`
+- `speechAndTextAnalytics:topic:testPhrase` (jobs and their notifications)
+- only for `-TranscriptSearch`: `analytics:conversationDetail:view`, `recording:recording:view`, `speechAndTextAnalytics:data:view`
 
 ```powershell
 .\Test-TopicPhrases.ps1                                             # everything from CONFIG
 .\Test-TopicPhrases.ps1 -StartDate '2026-09-01' -EndDate '2026-09-30' -Strictness 60
-.\Test-TopicPhrases.ps1 -MaxMatchesPerPhrase 100 -SearchMatchType EXACT_PHRASE
-.\Test-TopicPhrases.ps1 -CountsOnly                                 # skip the matched-conversation step
+.\Test-TopicPhrases.ps1 -CountsOnly                                 # counts only, no listener
+.\Test-TopicPhrases.ps1 -ProxyUrl http://proxy.corp:8080 -KeepListenerLog
+.\Test-TopicPhrases.ps1 -TranscriptSearch -MaxMatchesPerPhrase 100  # extra wording-based list
 ```
 
 | Output | Columns |
 |---|---|
-| `TopicPhraseTest_<stamp>.csv` (one row per phrase) | `Phrase, MatchedTranscripts, ProcessedTranscripts, MatchPct, SearchHits, State, SecondsToComplete, JobId, Error` |
-| `TopicPhraseMatches_<stamp>.csv` (one row per conversation) | `Phrase, ConversationId, ConversationStart, Speaker, DetectedTranscript, MatchScorePct, OffsetSec, CommunicationId, Error` |
+| `TopicPhraseTest_<stamp>.csv` (one row per phrase) | `Phrase, MatchedTranscripts, ProcessedTranscripts, MatchPct, MatchedConversationsReceived, SearchHits, State, SecondsToComplete, JobId, Error` |
+| `TopicPhraseMatches_<stamp>.csv` (one row per matched conversation) | `Phrase, ConversationId, ConversationTime, MediaType, FoundPhrase, Snippet, Confidence, CommunicationId, TranscriptId, JobId` |
+| `TopicPhraseSearch_<stamp>.csv` (only with `-TranscriptSearch`) | `Phrase, ConversationId, ConversationStart, Speaker, DetectedTranscript, MatchScorePct, OffsetSec, CommunicationId, Error` |
 
-- **`MatchScorePct`** is the percentage of the phrase's words found in the detected sentence (100 = verbatim, ignoring case and punctuation). Rows below `-MinMatchScore` (default 60) show the closest sentence in `Error` instead.
-- **`OffsetSec`** is how far into the call the sentence was said.
+- `MatchedConversationsReceived` should equal `MatchedTranscripts`. If it is lower, the notification arrived late or not at all (`-NotificationWaitSeconds`, default 120, is how long the script waits after a job finishes); the `Error` column says so.
+- `FoundPhrase`, `Snippet` and `Confidence` are exactly what Genesys returns for the match.
 
-**Transcript search field names are only partly verified.** The API requires a `language` criterion (it returns `REQUIRED_SEARCH_FIELD: language` without one); the script sends `-SearchLanguage`, which defaults to the `-Dialect` value (`en-AU`). The other field names, `transcript.content`, `conversationStartTime` and `mediaType`, are best guesses. If the search returns HTTP 400 the warning names the rejected field; change it with `-SearchTextField`, `-SearchDateField`, `-SearchMediaTypeField` or `-SearchLanguage` (try `en-au` in lower case if hits are unexpectedly 0). After three consecutive search failures the step is skipped for the remaining phrases.
+**Transcript search (`-TranscriptSearch`) field names are only partly verified.** The API requires a `language` criterion (it returns `REQUIRED_SEARCH_FIELD: language` without one); the script sends `-SearchLanguage`, which defaults to the `-Dialect` value (`en-AU`). The other field names, `transcript.content`, `conversationStartTime` and `mediaType`, are best guesses. If the search returns HTTP 400 the warning names the rejected field; change it with `-SearchTextField`, `-SearchDateField`, `-SearchMediaTypeField` or `-SearchLanguage` (try `en-au` in lower case if hits are unexpectedly 0). After three consecutive search failures the step is skipped for the remaining phrases.
 
 **Sanity check the semantic counts.** Add a phrase agents definitely say (e.g. `thanks for calling`) to `$Phrases`. If even that comes back `matched 0`, the job settings (programs, dialect, participants, date window) are wrong rather than the phrases.
 

@@ -11,28 +11,35 @@
       2. Polls GET /api/v2/speechandtextanalytics/topics/testphrase/jobs/{jobId}
          until the job finishes
       3. Records processedTranscriptsCount / matchedTranscriptsCount
-      4. Matched conversations (skip with -CountsOnly): the job's per-conversation
-         detail is only published on a WebSocket notification, which Constrained
-         Language Mode can't open. So the script runs
-         POST /api/v2/speechandtextanalytics/transcripts/search for each phrase,
-         downloads each hit's transcript
-         (GET .../conversations/{id}/communications/{id}/transcripturl) and picks the
-         sentence that best matches the phrase. This is wording-based, so it finds
-         fewer conversations than the semantic MatchedTranscripts count.
+      4. Matched conversations (skip with -CountsOnly): the exact list the UI shows.
+         Genesys publishes it only on the notification topic
+         v2.speechandtextanalytics.topics.testphrase.jobs.{jobId}, over a WebSocket.
+         .NET WebSockets are blocked in Constrained Language Mode, so the script
+         creates a channel (POST /api/v2/notifications/channels), runs the Windows
+         built-in curl.exe (8.11+ has WebSocket support) as a child process to read
+         it, subscribes each job's topic, and parses the frames curl writes.
+      5. Optional (-TranscriptSearch): a wording-based list of conversations from
+         POST /api/v2/speechandtextanalytics/transcripts/search + each transcript.
 
     Output:
-      TopicPhraseTest_<stamp>.csv     one row per phrase: semantic counts, search hits
-      TopicPhraseMatches_<stamp>.csv  one row per conversation: phrase, conversation id,
-                                      speaker, detected transcript sentence, match score
+      TopicPhraseTest_<stamp>.csv     one row per phrase: counts, conversations received
+      TopicPhraseMatches_<stamp>.csv  one row per matched conversation: phrase,
+                                      conversation id, time, found phrase, snippet,
+                                      confidence, communication/transcript id
+      TopicPhraseSearch_<stamp>.csv   only with -TranscriptSearch
 
     Constrained Language Mode safe (Windows PowerShell 5.1 under AppLocker/WDAC):
     no .NET static calls, no ::new(), no [pscustomobject] casts, no Add-Type.
 
     OAuth client (Client Credentials grant) role permissions:
-      speechAndTextAnalytics:topic:testPhrase     phrase test jobs (counts)
-      analytics:conversationDetail:view           transcript search
-      recording:recording:view                    transcript search + transcript URL
-      speechAndTextAnalytics:data:view            transcript URL
+      speechAndTextAnalytics:topic:testPhrase     phrase test jobs + notifications
+      analytics:conversationDetail:view           -TranscriptSearch only
+      recording:recording:view                    -TranscriptSearch only
+      speechAndTextAnalytics:data:view            -TranscriptSearch only
+
+    Requires curl.exe 8.11 or later with WebSocket support (Windows 11 / Server 2025
+    ship it; check "curl.exe -V" lists WebSockets under Features). Without it the
+    script still reports the counts.
 
 .EXAMPLE
     # Everything set in the CONFIG block
@@ -129,13 +136,30 @@ param(
     [ValidateRange(0, 10)]
     [int]$MaxRetries = 6,
 
-    # --- Matched conversations (conversation id + detected transcript text) ---
-    # The test-phrase job only returns counts over REST (the per-conversation detail goes
-    # out on a WebSocket notification, which Constrained Language Mode can't open). So
-    # matches come from the transcript search API + each hit's transcript instead. That
-    # search matches WORDING, not meaning: it finds fewer calls than the semantic count.
-    # Skip this stage (counts only):
+    # --- Matched conversations: the exact list the UI shows ---
+    # Genesys publishes a test job's matched conversations only on the notification
+    # topic v2.speechandtextanalytics.topics.testphrase.jobs.{jobId}, over a WebSocket.
+    # .NET WebSockets are blocked in Constrained Language Mode, so the script runs the
+    # Windows built-in curl.exe (8.11 or later has WebSocket support) as a child process
+    # and parses the frames it writes to a file.
+    # Skip this (counts only):
     [switch]$CountsOnly,
+    [string]$CurlPath = 'curl.exe',
+    # curl does not use the Windows system proxy; set this if you need one, e.g. http://proxy:8080
+    [string]$ProxyUrl,
+    # Seconds to wait for a finished job's notification before giving up on it.
+    [ValidateRange(5, 900)]
+    [int]$NotificationWaitSeconds = 120,
+    # Hard limit on how long the listener process may run.
+    [ValidateRange(60, 14400)]
+    [int]$ListenerMaxSeconds = 3600,
+    # Keep the raw notification frames file (troubleshooting).
+    [switch]$KeepListenerLog,
+
+    # --- Optional extra: wording-based transcript search (writes TopicPhraseSearch_*.csv) ---
+    # Finds calls whose transcript contains the phrase's WORDING via
+    # POST /api/v2/speechandtextanalytics/transcripts/search. Off by default.
+    [switch]$TranscriptSearch,
     # Max conversations to pull per phrase (each costs 2-3 API calls).
     [ValidateRange(1, 1000)]
     [int]$MaxMatchesPerPhrase = 25,
@@ -423,7 +447,136 @@ function Submit-PhraseJob {
 }
 
 # ----------------------------------------------------------------------------------
-# Matched conversations: transcript search + transcript download
+# Matched conversations: notification channel read through curl.exe (WebSocket)
+# ----------------------------------------------------------------------------------
+
+# Splits a stream of concatenated JSON objects ("{..}{..}{..}") into complete objects.
+# An incomplete trailing object (still being written) is left out.
+function Split-JsonObjects {
+    param([string]$Text)
+    $objects = @()
+    if (-not $Text) { return $objects }
+    $chars = $Text.ToCharArray()
+    $depth = 0
+    $inString = $false
+    $escape = $false
+    $start = -1
+    for ($i = 0; $i -lt $chars.Length; $i++) {
+        $c = $chars[$i]
+        if ($inString) {
+            if ($escape) { $escape = $false }
+            elseif ($c -eq '\') { $escape = $true }
+            elseif ($c -eq '"') { $inString = $false }
+            continue
+        }
+        if ($c -eq '"') { $inString = $true; continue }
+        if ($c -eq '{') {
+            if ($depth -eq 0) { $start = $i }
+            $depth++
+        }
+        elseif ($c -eq '}') {
+            if ($depth -gt 0) {
+                $depth--
+                if ($depth -eq 0 -and $start -ge 0) {
+                    $objects += $Text.Substring($start, $i - $start + 1)
+                    $start = -1
+                }
+            }
+        }
+    }
+    return $objects
+}
+
+function Test-CurlWebSocket {
+    $text = ''
+    try { $text = (& $script:CurlPathValue -V 2>&1) | Out-String }
+    catch { return @{ Ok = $false; Reason = ('could not run "{0}": {1}' -f $script:CurlPathValue, $_.Exception.Message); Version = '' } }
+    $version = ''
+    if ($text -match 'curl\s+(\d+\.\d+(\.\d+)?)') { $version = $matches[1] }
+    if ($text -notmatch '(?i)websocket') {
+        return @{ Ok = $false; Version = $version; Reason = ('curl {0} at "{1}" was built without WebSocket support (needs curl 8.11 or later; check "curl.exe -V" lists WebSockets under Features)' -f $version, $script:CurlPathValue) }
+    }
+    return @{ Ok = $true; Version = $version; Reason = '' }
+}
+
+# Creates a notification channel and starts curl.exe reading its WebSocket into a file.
+function Start-NotificationListener {
+    $channel = Invoke-GcApi -Method Post -Path '/api/v2/notifications/channels'
+    if ($null -eq $channel -or -not $channel.id -or -not $channel.connectUri) {
+        throw 'POST /api/v2/notifications/channels did not return a channel id and connectUri.'
+    }
+    $script:ChannelId = [string]$channel.id
+    $script:ListenerOut = Join-Path -Path $script:TempFolder -ChildPath ('gc_testphrase_ws_' + $script:RunStamp + '.log')
+    $script:ListenerErr = Join-Path -Path $script:TempFolder -ChildPath ('gc_testphrase_ws_' + $script:RunStamp + '.err')
+    $args = @('--no-buffer', '--silent', '--show-error', '--max-time', [string]$script:ListenerMaxSecondsValue)
+    if ($script:ProxyUrlValue) { $args += @('--proxy', $script:ProxyUrlValue) }
+    $args += [string]$channel.connectUri
+    $proc = Start-Process -FilePath $script:CurlPathValue -ArgumentList $args -NoNewWindow -PassThru `
+        -RedirectStandardOutput $script:ListenerOut -RedirectStandardError $script:ListenerErr
+    Start-Sleep -Seconds 2
+    if ($proc.HasExited) {
+        $err = ''
+        try { $err = (Get-Content -Path $script:ListenerErr -Raw -ErrorAction SilentlyContinue) } catch { $err = '' }
+        throw ('curl exited straight away (code {0}). {1}' -f $proc.ExitCode, ([string]$err).Trim())
+    }
+    $script:ListenerProc = $proc
+    $script:FramesSeen = 0
+    Write-Host ('Notification listener: channel {0}, curl pid {1}' -f $script:ChannelId, $proc.Id)
+}
+
+function Stop-NotificationListener {
+    if ($null -eq $script:ListenerProc) { return }
+    try { if (-not $script:ListenerProc.HasExited) { Stop-Process -Id $script:ListenerProc.Id -Force -ErrorAction SilentlyContinue } } catch { }
+    $script:ListenerProc = $null
+    if (-not $script:KeepListenerLogValue) {
+        Remove-Item -Path $script:ListenerOut -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $script:ListenerErr -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Add-JobSubscription {
+    param([string]$JobId)
+    $topic = 'v2.speechandtextanalytics.topics.testphrase.jobs.' + $JobId
+    $resp = Invoke-GcApi -Method Post -Path ('/api/v2/notifications/channels/' + $script:ChannelId + '/subscriptions?ignoreErrors=true') -Body @(@{ id = $topic })
+    foreach ($e in $resp.entities) {
+        if ($null -ne $e -and [string]$e.id -eq $topic -and $e.rejectionReason) {
+            Write-Warning ('Subscription to {0} rejected: {1} (missing permissions: {2})' -f $topic, $e.rejectionReason, (@($e.missingPermissions) -join ', '))
+        }
+    }
+}
+
+# Reads new frames from the listener file; stores matched transcripts per job id.
+function Read-JobNotifications {
+    if ($null -eq $script:ListenerProc) { return }
+    $raw = ''
+    try { $raw = Get-Content -Path $script:ListenerOut -Raw -ErrorAction SilentlyContinue } catch { $raw = '' }
+    if (-not $raw) { return }
+    $frames = @(Split-JsonObjects -Text $raw)
+    for ($i = $script:FramesSeen; $i -lt $frames.Count; $i++) {
+        $msg = $null
+        try { $msg = $frames[$i] | ConvertFrom-Json } catch { $msg = $null }
+        if ($null -eq $msg -or -not $msg.topicName) { continue }
+        $topic = [string]$msg.topicName
+        if ($topic -notlike '*testphrase.jobs.*') { continue }
+        $body = $msg.eventBody
+        $jobId = ''
+        if ($null -ne $body -and $body.id) { $jobId = [string]$body.id }
+        if (-not $jobId) { $jobId = $topic.Substring($topic.LastIndexOf('.') + 1) }
+        if (-not $script:JobResults.ContainsKey($jobId)) { $script:JobResults[$jobId] = @{ State = ''; Transcripts = @(); Notifications = 0 } }
+        $entry = $script:JobResults[$jobId]
+        $entry.Notifications = $entry.Notifications + 1
+        if ($null -ne $body -and $body.state) { $entry.State = [string]$body.state }
+        foreach ($res in @($body.testTopicPhraseResults)) {
+            if ($null -eq $res) { continue }
+            foreach ($t in @($res.matchedTranscripts)) { if ($null -ne $t) { $entry.Transcripts += , $t } }
+        }
+        Write-Verbose ('notification for job {0}: state {1}, {2} matched transcripts so far' -f $jobId, $entry.State, $entry.Transcripts.Count)
+    }
+    $script:FramesSeen = $frames.Count
+}
+
+# ----------------------------------------------------------------------------------
+# Optional: wording-based transcript search + transcript download
 # ----------------------------------------------------------------------------------
 
 # ISO-8601 UTC built from components: culture and calendar independent.
@@ -648,6 +801,16 @@ $script:SearchLanguageValue = $SearchLanguage
 if (-not $script:SearchLanguageValue) { $script:SearchLanguageValue = $Dialect }
 $script:TempFolder = $env:TEMP
 if (-not $script:TempFolder) { $script:TempFolder = $OutputFolder }
+$script:CurlPathValue = $CurlPath
+$script:ProxyUrlValue = $ProxyUrl
+$script:ListenerMaxSecondsValue = $ListenerMaxSeconds
+$script:KeepListenerLogValue = [bool]$KeepListenerLog
+$script:ListenerProc = $null
+$script:ChannelId = ''
+$script:JobResults = @{}
+$rs = Get-Date
+$script:RunStamp = (Get-Padded $rs.Year 4) + (Get-Padded $rs.Month 2) + (Get-Padded $rs.Day 2) + '_' + (Get-Padded $rs.Hour 2) + (Get-Padded $rs.Minute 2) + (Get-Padded $rs.Second 2)
+if (-not (Test-Path -Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder | Out-Null }
 
 # --- Authentication
 if ($AccessToken) {
@@ -676,6 +839,28 @@ Write-Host ('Topic settings      : dialect={0} matching={1} participants={2} str
 Write-Host ('Phrases             : {0}   (up to {1} jobs at a time)' -f $phraseList.Count, $MaxConcurrentJobs)
 Write-Host ''
 
+# --- Notification listener (matched conversations)
+$listening = $false
+if (-not $CountsOnly) {
+    $curlCheck = Test-CurlWebSocket
+    if ($curlCheck.Ok) {
+        try {
+            Start-NotificationListener
+            $listening = $true
+        }
+        catch {
+            Write-Warning ('Could not start the notification listener: {0}' -f $_.Exception.Message)
+        }
+    }
+    else {
+        Write-Warning ('Matched conversations unavailable: {0}.' -f $curlCheck.Reason)
+    }
+    if (-not $listening) {
+        Write-Warning 'Continuing with counts only. Use -TranscriptSearch for a wording-based list of conversations instead.'
+    }
+    Write-Host ''
+}
+
 # --- Run the jobs: keep up to MaxConcurrentJobs in flight, poll until each finishes.
 $results = @()
 $pending = @()       # hashtables: Phrase, JobId, Submitted, LastState, Row
@@ -695,6 +880,8 @@ while ($nextIndex -lt $phraseList.Count -or $pending.Count -gt 0) {
             MatchedTranscripts  = ''
             MatchPct            = ''
             SecondsToComplete   = ''
+            MatchedConversationsReceived = ''
+            FinishedAt          = $null
             Error               = ''
         }
         try {
@@ -702,6 +889,10 @@ while ($nextIndex -lt $phraseList.Count -or $pending.Count -gt 0) {
             $row.JobId = [string]$job.id
             $row.State = [string]$job.state
             Write-Host ('[{0}/{1}] submitted  {2}  "{3}"' -f $nextIndex, $phraseList.Count, $row.JobId, $phrase)
+            if ($listening) {
+                try { Add-JobSubscription -JobId $row.JobId }
+                catch { Write-Warning ('Could not subscribe to notifications for job {0}: {1}' -f $row.JobId, $_.Exception.Message) }
+            }
             $pending += , @{ Phrase = $phrase; JobId = $row.JobId; Submitted = (Get-Date); LastState = [string]$job.state; Row = $row }
         }
         catch {
@@ -740,6 +931,7 @@ while ($nextIndex -lt $phraseList.Count -or $pending.Count -gt 0) {
         $elapsed = ((Get-Date) - $p.Submitted).TotalSeconds
         if (Test-JobFinished -State $state) {
             $row.SecondsToComplete = [string]([int]$elapsed)
+            $row.FinishedAt = Get-Date
             if (Test-JobFailed -State $state) {
                 $row.Error = ('Job ended in state {0}' -f $state)
                 Write-Warning ('job {0} "{1}" ended in state {2}' -f $p.JobId, $p.Phrase, $state)
@@ -766,12 +958,74 @@ while ($nextIndex -lt $phraseList.Count -or $pending.Count -gt 0) {
         }
     }
     $pending = $stillPending
+    if ($listening) { Read-JobNotifications }
 }
 
-# --- Matched conversations: conversation id, phrase, detected transcript text
+# --- Wait for the notifications of finished jobs, then build the matched-conversation rows
 $matchRows = @()
+if ($listening) {
+    while ($true) {
+        Read-JobNotifications
+        $waiting = @(foreach ($r in $results) {
+                if (-not $r.JobId -or $null -eq $r.FinishedAt -or $r.Error) { continue }
+                if ($r.MatchedTranscripts -eq '' -or [int]$r.MatchedTranscripts -eq 0) { continue }
+                if ($script:JobResults.ContainsKey($r.JobId) -and $script:JobResults[$r.JobId].Transcripts.Count -ge [int]$r.MatchedTranscripts) { continue }
+                if (((Get-Date) - $r.FinishedAt).TotalSeconds -gt $NotificationWaitSeconds) { continue }
+                $r
+            })
+        if ($waiting.Count -eq 0) { break }
+        if ($script:ListenerProc.HasExited) {
+            Write-Warning 'The curl listener process exited before all notifications arrived.'
+            break
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+    Stop-NotificationListener
+
+    foreach ($r in $results) {
+        if (-not $r.JobId) { continue }
+        $entry = $null
+        if ($script:JobResults.ContainsKey($r.JobId)) { $entry = $script:JobResults[$r.JobId] }
+        if ($null -eq $entry) {
+            $r.MatchedConversationsReceived = '0'
+            if ($r.MatchedTranscripts -ne '' -and [int]$r.MatchedTranscripts -gt 0 -and -not $r.Error) {
+                $r.Error = ('No notification received within {0}s of the job finishing' -f $NotificationWaitSeconds)
+            }
+            continue
+        }
+        $r.MatchedConversationsReceived = [string]$entry.Transcripts.Count
+        foreach ($t in $entry.Transcripts) {
+            $when = ''
+            if ($null -ne $t.timestamp) {
+                try {
+                    $ms = [double]$t.timestamp
+                    $when = Format-Local (([datetime]'1970-01-01').AddMilliseconds($ms))
+                } catch { $when = [string]$t.timestamp }
+            }
+            $detected = @($t.detectedPhrases)
+            if ($detected.Count -eq 0) { $detected = @($null) }
+            foreach ($d in $detected) {
+                $matchRows += , @{
+                    Phrase           = $r.Phrase
+                    ConversationId   = [string]$t.conversationId
+                    ConversationTime = $when
+                    MediaType        = [string]$t.mediaType
+                    FoundPhrase      = $(if ($null -ne $d) { [string]$d.foundPhrase } else { '' })
+                    Snippet          = $(if ($null -ne $d) { [string]$d.snippet } else { '' })
+                    Confidence       = $(if ($null -ne $d -and $null -ne $d.confidence) { [string]$d.confidence } else { '' })
+                    CommunicationId  = [string]$t.communicationId
+                    TranscriptId     = [string]$t.transcriptId
+                    JobId            = $r.JobId
+                }
+            }
+        }
+    }
+}
+
+# --- Optional: wording-based transcript search
+$searchRows = @()
 $searchTotals = @{}
-if (-not $CountsOnly) {
+if ($TranscriptSearch) {
     if (-not (Test-Path -Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder | Out-Null }
     $side = $Participants.ToLower()
     Write-Host ''
@@ -824,7 +1078,7 @@ if (-not $CountsOnly) {
             if ($convStart) { try { $row.ConversationStart = Format-Local ([datetime]$convStart) } catch { $row.ConversationStart = $convStart } }
             if (-not $convId) {
                 $row.Error = 'Search hit had no conversation id'
-                $matchRows += , $row
+                $searchRows += , $row
                 continue
             }
             $key = $convId + '|' + $commId
@@ -849,7 +1103,7 @@ if (-not $CountsOnly) {
                     $row.Error = ('No {0} sentences in transcript' -f $side)
                 }
             }
-            $matchRows += , $row
+            $searchRows += , $row
         }
     }
 }
@@ -859,40 +1113,56 @@ foreach ($r in $results) {
     $k = $r.Phrase.ToLower()
     if ($searchTotals.ContainsKey($k)) { $r.SearchHits = $searchTotals[$k] } else { $r.SearchHits = '' }
 }
-$columns = @('Phrase', 'MatchedTranscripts', 'ProcessedTranscripts', 'MatchPct', 'SearchHits', 'State', 'SecondsToComplete', 'JobId', 'Error')
+$columns = @('Phrase', 'MatchedTranscripts', 'ProcessedTranscripts', 'MatchPct', 'MatchedConversationsReceived', 'SearchHits', 'State', 'SecondsToComplete', 'JobId', 'Error')
 $rows = @(foreach ($r in $results) { New-Object PSObject -Property $r })
 
 # Sort: most matches first, then by phrase.
 $sorted = @($rows | Sort-Object -Property @{ Expression = { if ($_.MatchedTranscripts -eq '') { -1 } else { [int]$_.MatchedTranscripts } }; Descending = $true }, Phrase)
 
-if (-not (Test-Path -Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder | Out-Null }
-$n = Get-Date
-$stamp = (Get-Padded $n.Year 4) + (Get-Padded $n.Month 2) + (Get-Padded $n.Day 2) + '_' + (Get-Padded $n.Hour 2) + (Get-Padded $n.Minute 2) + (Get-Padded $n.Second 2)
+# Export-Csv with no rows writes only a byte-order mark, which Excel shows as "ï»¿",
+# so an empty result still gets a header row.
+function Write-CsvRows {
+    param([string]$Path, $Rows, [string[]]$Columns)
+    if (@($Rows).Count -gt 0) {
+        @(foreach ($m in $Rows) { New-Object PSObject -Property $m }) | Select-Object $Columns |
+            Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        Set-Content -Path $Path -Value ('"' + ($Columns -join '","') + '"') -Encoding UTF8
+    }
+}
+
+$stamp = $script:RunStamp
 $csvPath = Join-Path -Path $OutputFolder -ChildPath ('TopicPhraseTest_' + $stamp + '.csv')
 $sorted | Select-Object $columns | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 $matchPath = ''
-if (-not $CountsOnly) {
+if ($listening) {
     $matchPath = Join-Path -Path $OutputFolder -ChildPath ('TopicPhraseMatches_' + $stamp + '.csv')
-    $matchColumns = @('Phrase', 'ConversationId', 'ConversationStart', 'Speaker', 'DetectedTranscript', 'MatchScorePct', 'OffsetSec', 'CommunicationId', 'Error')
-    if ($matchRows.Count -gt 0) {
-        @(foreach ($m in $matchRows) { New-Object PSObject -Property $m }) | Select-Object $matchColumns |
-            Export-Csv -Path $matchPath -NoTypeInformation -Encoding UTF8
-    }
-    else {
-        # Export-Csv with no rows writes only a byte-order mark, which Excel shows as "ï»¿".
-        Set-Content -Path $matchPath -Value ('"' + ($matchColumns -join '","') + '"') -Encoding UTF8
-    }
+    $matchColumns = @('Phrase', 'ConversationId', 'ConversationTime', 'MediaType', 'FoundPhrase', 'Snippet', 'Confidence', 'CommunicationId', 'TranscriptId', 'JobId')
+    $sortedMatches = @($matchRows | Sort-Object { $_.Phrase }, { $_.ConversationTime })
+    Write-CsvRows -Path $matchPath -Rows $sortedMatches -Columns $matchColumns
+}
+$searchPath = ''
+if ($TranscriptSearch) {
+    $searchPath = Join-Path -Path $OutputFolder -ChildPath ('TopicPhraseSearch_' + $stamp + '.csv')
+    $searchColumns = @('Phrase', 'ConversationId', 'ConversationStart', 'Speaker', 'DetectedTranscript', 'MatchScorePct', 'OffsetSec', 'CommunicationId', 'Error')
+    Write-CsvRows -Path $searchPath -Rows $searchRows -Columns $searchColumns
 }
 
 Write-Host ''
 Write-Host '================ Topic phrase test results ================'
-$sorted | Select-Object MatchedTranscripts, ProcessedTranscripts, MatchPct, State, Phrase | Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host
+$sorted | Select-Object MatchedTranscripts, MatchedConversationsReceived, ProcessedTranscripts, MatchPct, State, Phrase | Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host
 $failed = @($rows | Where-Object { $_.Error })
-if ($failed.Count -gt 0) { Write-Warning ('{0} phrase(s) did not complete; see the Error column.' -f $failed.Count) }
-if (-not $CountsOnly) {
-    $found = @($matchRows | Where-Object { $_.DetectedTranscript }).Count
-    Write-Host ('Matched conversations: {0} with a detected sentence, {1} rows in total (see the Error column for the rest).' -f $found, $matchRows.Count)
-    Write-Host 'Note: SearchHits / matches come from wording-based transcript search; MatchedTranscripts is Genesys''s semantic count, so they will differ.'
+if ($failed.Count -gt 0) { Write-Warning ('{0} phrase(s) have an error; see the Error column.' -f $failed.Count) }
+if ($listening) {
+    $convCount = @($matchRows | ForEach-Object { $_.ConversationId } | Sort-Object -Unique).Count
+    Write-Host ('Matched conversations received from Genesys: {0} rows, {1} distinct conversations.' -f $matchRows.Count, $convCount)
+    if ($script:KeepListenerLogValue) { Write-Host ('Raw notification frames: {0}' -f $script:ListenerOut) }
+}
+if ($TranscriptSearch) {
+    $found = @($searchRows | Where-Object { $_.DetectedTranscript }).Count
+    Write-Host ('Transcript search (wording-based): {0} conversations with a detected sentence, {1} rows in total.' -f $found, $searchRows.Count)
 }
 Write-Host ('Counts CSV : {0}' -f $csvPath)
 if ($matchPath) { Write-Host ('Matches CSV: {0}' -f $matchPath) }
+if ($searchPath) { Write-Host ('Search CSV : {0}' -f $searchPath) }
